@@ -1,0 +1,38 @@
+[project]
+name = "a13n-anycap"
+version = "0.1.0"
+description = "AnyCap media generation tools for a13n Service"
+readme = "README.md"
+requires-python = ">=3.13"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = [
+    "a13n-service>=0.3.2,<0.4",
+    "a13n-harness>=0.40,<0.41",
+    "httpx>=0.28,<1",
+    "pydantic>=2,<3",
+    "pydantic-ai-slim",
+]
+
+[project.entry-points."a13n_service.app_plugins"]
+"a13n-anycap" = "a13n_anycap.app:definition"
+
+[project.entry-points."a13n_harness.plugins"]
+"a13n-anycap" = "a13n_anycap.tools:AnyCapFactory"
+
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/a13n_anycap"]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "ruff>=0.14,<1"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

@@ -1,0 +1,189 @@
+import asyncio
+import json
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import httpx
+import pytest
+from a13n_harness.configuration import RunConfiguration
+from a13n_harness.plugin_factories import HarnessPluginFactoryContext
+from a13n_service.app import build_app
+from a13n_service.app_definitions import discover_apps
+from a13n_service.runs.tables import AttemptRow, RunRow
+from pydantic_ai import Agent, DeferredToolRequests
+from pydantic_ai.exceptions import ToolFailed
+from pydantic_ai.models.test import TestModel
+
+from a13n_anycap import tools
+from a13n_anycap.app import KEYS_VARIABLE, load_workspace_keys
+from a13n_anycap.tools import APP_ID, AnyCapFactory, AnyCapTools
+
+TASK_ID = "ct_0123456789abcdef"
+
+
+def test_service_discovers_app_and_paid_tool_requests_approval() -> None:
+    app = next(item for item in discover_apps() if item.app_id == APP_ID)
+    assert app.distribution == "a13n-anycap"
+    assert app.definition.factory_keys == {APP_ID}
+    assert build_app(role="worker").state is not None
+    plugin = AnyCapFactory().create_plugin(HarnessPluginFactoryContext(APP_ID, "anycap", {}, {}))
+    agent = Agent(
+        TestModel(call_tools=["anycap_submit_video"]),
+        output_type=[str, DeferredToolRequests],
+        capabilities=plugin.get_capabilities(),
+    )
+    result = asyncio.run(agent.run("Generate a video")).output
+    assert isinstance(result, DeferredToolRequests)
+    assert [request.tool_name for request in result.approvals] == ["anycap_submit_video"]
+
+
+@pytest.fixture
+def service_calls(monkeypatch):
+    """Use the released Service's Run context contract with isolated storage and HTTP."""
+    current = datetime.now(UTC)
+    run = SimpleNamespace(
+        id="run_a",
+        status="running",
+        current_attempt_id="rat_a",
+        cancel_requested_at=None,
+        principal_id="usr_test",
+        workspace_id="ws_first",
+    )
+    attempt = SimpleNamespace(run_id="run_a", status="running", lease_expires_at=current + timedelta(seconds=60))
+    session = SimpleNamespace(get=AsyncMock(side_effect=lambda table, _: {RunRow: run, AttemptRow: attempt}[table]))
+    state = SimpleNamespace(in_session=False, run=run, attempt=attempt)
+
+    @asynccontextmanager
+    async def short_session(_):
+        state.in_session = True
+        try:
+            yield session
+        finally:
+            state.in_session = False
+
+    monkeypatch.setattr(tools, "short_session", short_session)
+    monkeypatch.setattr(tools, "now", AsyncMock(return_value=current))
+    monkeypatch.setattr(tools, "authorize_execution", AsyncMock())
+    monkeypatch.setenv(KEYS_VARIABLE, '{"ws_first":"test-key","ws_second":"test-key"}')
+    factory = AnyCapFactory()
+    factory.runtime = SimpleNamespace(storage=object(), access=object())
+    factory.keys = load_workspace_keys()
+    plugin = factory.create_plugin(HarnessPluginFactoryContext(APP_ID, "anycap", {}, {}))
+    assert isinstance(plugin, AnyCapTools)
+    context = SimpleNamespace(
+        deps=SimpleNamespace(
+            configuration=RunConfiguration(),
+            instance=SimpleNamespace(
+                identity=SimpleNamespace(issuer="a13n-service", subject="usr_test"),
+                agent_instance_id="run_a",
+                host_refs={"run_id": "run_a", "attempt_id": "rat_a"},
+            ),
+        ),
+        tool_call_id="call_a",
+    )
+    return factory, plugin, context, state
+
+
+def test_video_submit_and_cross_run_read_without_cross_workspace_access(service_calls) -> None:
+    factory, plugin, context, state = service_calls
+    requests = []
+
+    def anycap(request):
+        assert not state.in_session
+        requests.append(request)
+        assert request.url.host == "api.anycap.ai"
+        assert request.headers["Authorization"] == "Bearer test-key"
+        task = {"task_id": TASK_ID}
+        if request.method == "POST":
+            assert json.loads(request.content) == {
+                "model": "test-video",
+                "prompt": "A sunrise",
+                "mode": "text-to-video",
+                "generate_audio": False,
+            }
+            task.update(status="queued", poll_after_ms=2000)
+            return httpx.Response(202, json={"status": "success", "data": task})
+        assert request.url.path == f"/v1/video/tasks/{TASK_ID}"
+        task.update(
+            status="succeeded",
+            result={
+                "model": "test-video",
+                "credit_cost": 2,
+                "outputs": [{"type": "video", "url": "https://media.example/clip.mp4", "mime_type": "video/mp4"}],
+            },
+        )
+        return httpx.Response(200, json={"status": "success", "data": task})
+
+    async def check():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(anycap)) as factory.http:
+            queued = await plugin.anycap_submit_video(context, "test-video", "A sunrise", generate_audio=False)
+            assert queued["poll_after_ms"] == 2000
+            assert queued["task_id"] == TASK_ID
+            context.deps.instance.agent_instance_id = "run_b"
+            context.deps.instance.host_refs["run_id"] = "run_b"
+            state.run.id = "run_b"
+            # The current attempt belongs to the new Run, just as a real Service claim would.
+            state.attempt.run_id = "run_b"
+            completed = await plugin.anycap_get_video_task(context, queued["task_handle"])
+            assert completed["result"]["outputs"][0]["url"] == "https://media.example/clip.mp4"
+            state.run.workspace_id = "ws_second"
+            with pytest.raises(ToolFailed, match="issued for this workspace"):
+                await plugin.anycap_get_video_task(context, queued["task_handle"])
+
+    asyncio.run(check())
+    assert [request.method for request in requests] == ["POST", "GET"]
+
+
+def test_ambiguous_audio_submit_is_not_retried_or_leaked(service_calls) -> None:
+    factory, plugin, context, state = service_calls
+    requests = []
+
+    def anycap(request):
+        assert not state.in_session
+        requests.append(request)
+        assert request.url.path == "/v1/audio/generate"
+        assert json.loads(request.content) == {
+            "model": "test-audio",
+            "prompt": "Hello",
+            "mode": "text-to-audio",
+            "speaker_ids": ["voice"],
+        }
+        raise httpx.ReadTimeout("Bearer test-key")
+
+    async def check():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(anycap)) as factory.http:
+            with pytest.raises(ToolFailed, match="outcome is unknown") as error:
+                await plugin.anycap_generate_audio(context, "test-audio", "Hello", "voice")
+        assert "test-key" not in str(error.value)
+        assert requests[0].headers["X-Trace-ID"] in str(error.value)
+
+    asyncio.run(check())
+    assert len(requests) == 1
+
+
+def test_unapproved_host_or_cancelled_run_never_sends_http(service_calls) -> None:
+    factory, plugin, context, state = service_calls
+
+    def unexpected_http(_):
+        pytest.fail("The plugin sent a request before establishing its authority")
+
+    async def check():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(unexpected_http)) as factory.http:
+            context.deps.configuration = RunConfiguration(allowed_hosts={"example.com"})
+            with pytest.raises(ToolFailed, match="must allow api.anycap.ai"):
+                await plugin.anycap_list_models(context, "audio")
+            context.deps.configuration = RunConfiguration()
+            state.run.cancel_requested_at = datetime.now(UTC)
+            with pytest.raises(ToolFailed, match="no longer active"):
+                await plugin.anycap_list_models(context, "audio")
+
+    asyncio.run(check())
+
+
+def test_invalid_startup_config_does_not_emit_secret(monkeypatch) -> None:
+    monkeypatch.setenv(KEYS_VARIABLE, '{"ws_test":"test secret"}')
+    with pytest.raises(ValueError, match=KEYS_VARIABLE) as error:
+        load_workspace_keys()
+    assert "test secret" not in str(error.value)
