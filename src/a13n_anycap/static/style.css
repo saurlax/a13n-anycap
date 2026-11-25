@@ -1,15 +1,95 @@
+.anycap-page.anycap-page {
+  max-width: none;
+}
+
 .anycap-settings {
-  max-width: 34rem;
-}
-
-.anycap-settings form {
   display: grid;
-  gap: 0.75rem;
-  margin-block: 1rem;
+  gap: 1.5rem;
+  min-width: 0;
 }
 
-.anycap-settings-actions {
+.anycap-section {
+  container-type: inline-size;
+  min-width: 0;
+  font-size: var(--a13n-text-sm, 0.875rem);
+}
+
+.anycap-section h2 {
+  margin: 0 0 0.625rem;
+  font-size: var(--a13n-text-base, 0.9375rem);
+  font-weight: 600;
+  letter-spacing: -0.011em;
+}
+
+.anycap-rows > .anycap-row + .anycap-row {
+  border-block-start: 1px solid var(--border);
+}
+
+.anycap-row {
+  padding-block: 0.875rem;
+}
+
+.anycap-row-main,
+.anycap-key-row,
+.anycap-actions {
   display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
+  align-items: center;
+  gap: 0.625rem;
+  min-width: 0;
+}
+
+.anycap-row-main,
+.anycap-key-row {
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.anycap-row-main label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.anycap-key-controls {
+  flex: 0 1 24rem;
+}
+
+.anycap-input {
+  flex: 1 1 10rem;
+  min-width: 0;
+}
+
+.anycap-form-actions {
+  justify-content: flex-end;
+}
+
+.anycap-feedback,
+.anycap-error,
+.anycap-row-feedback {
+  margin: 0;
+  font-size: var(--a13n-text-xs, 0.8125rem);
+}
+
+.anycap-row-feedback {
+  padding-block-end: 0.625rem;
+}
+
+.anycap-feedback {
+  color: var(--muted-foreground);
+}
+
+.anycap-error {
+  color: var(--destructive);
+}
+
+@container (max-width: 26.25rem) {
+  .anycap-key-row {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 0.625rem;
+  }
+
+  .anycap-key-controls {
+    flex: none;
+    flex-wrap: wrap;
+  }
 }

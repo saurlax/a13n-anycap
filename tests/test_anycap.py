@@ -23,6 +23,7 @@ from pydantic_ai.models.test import TestModel
 from a13n_anycap import tools
 from a13n_anycap.app import KEYS_VARIABLE, load_workspace_keys
 from a13n_anycap.credentials import WorkspaceCredential, credential_location, get_workspace_key
+from a13n_anycap.policy import WorkspacePolicyRow
 from a13n_anycap.tools import APP_ID, AnyCapFactory, AnyCapTools
 
 TASK_ID = "ct_0123456789abcdef"
@@ -61,16 +62,28 @@ def service_calls(monkeypatch):
     )
     attempt = SimpleNamespace(run_id="run_a", status="running", lease_expires_at=current + timedelta(seconds=60))
     credentials = {}
-    session = SimpleNamespace(
-        get=AsyncMock(
-            side_effect=lambda table, row_id: (
-                credentials.get(row_id) if table is WorkspaceCredential else {RunRow: run, AttemptRow: attempt}[table]
-            )
-        )
-    )
+    policies = {}
+    rows = {
+        AttemptRow: {"rat_a": attempt},
+        WorkspaceCredential: credentials,
+        WorkspacePolicyRow: policies,
+    }
+
+    def get_row(table, row_id):
+        if table is RunRow:
+            return run if row_id == run.id else None
+        return rows[table].get(row_id)
+
+    session = SimpleNamespace(get=AsyncMock(side_effect=get_row))
     keys = KeyRing(active_key_id="test", keys={"test": SecretStr(base64.b64encode(bytes(32)).decode())})
     state = SimpleNamespace(
-        in_session=False, run=run, attempt=attempt, credentials=credentials, session=session, keys=keys
+        in_session=False,
+        run=run,
+        attempt=attempt,
+        credentials=credentials,
+        policies=policies,
+        session=session,
+        keys=keys,
     )
 
     @asynccontextmanager
@@ -114,7 +127,7 @@ def test_workspace_key_overrides_environment_and_is_bound_to_its_workspace(servi
                 b"workspace-key", credential_location("org_test", "ws_first")
             ).model_dump_json()
             state.credentials["ws_first"] = WorkspaceCredential(workspace_id="ws_first", encrypted_key=encrypted)
-            client, _ = await plugin._client(context)
+            client, _ = await plugin._client(context, "video")
             assert client.key.get_secret_value() == "workspace-key"
 
             state.credentials["ws_second"] = WorkspaceCredential(workspace_id="ws_second", encrypted_key=encrypted)
@@ -122,8 +135,90 @@ def test_workspace_key_overrides_environment_and_is_bound_to_its_workspace(servi
                 await get_workspace_key(state.session, state.keys, "org_test", "ws_second")
 
             del state.credentials["ws_first"]
-            client, _ = await plugin._client(context)
+            client, _ = await plugin._client(context, "video")
             assert client.key == factory.keys["ws_first"]
+
+    asyncio.run(verify())
+
+
+def test_workspace_policy_ignores_legacy_model_filters_and_blocks_disabled_features(service_calls) -> None:
+    factory, plugin, context, state = service_calls
+    state.policies["ws_first"] = WorkspacePolicyRow(
+        workspace_id="ws_first",
+        policy={"video": {"models": ["first"]}, "audio": {"enabled": False}},
+    )
+    calls = []
+
+    def catalog(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        assert "Authorization" not in request.headers
+        models = [
+            {
+                "model": name,
+                "display_name": name,
+                "status": "active",
+                "operations": [{"operation": "generate", "modes": [{"mode": mode}]}],
+            }
+            for name, mode in [("first", "text-to-video"), ("second", "text-to-video"), ("edit-only", "edit-video")]
+        ]
+        return httpx.Response(200, json={"status": "success", "models": models})
+
+    async def verify() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(catalog)) as http:
+            factory.http = http
+            result = await plugin.anycap_list_models(context, "video")
+            assert [model["model"] for model in result["models"]] == ["first", "second", "edit-only"]
+            with pytest.raises(ToolFailed, match="audio is disabled"):
+                await plugin.anycap_generate_audio(context, "any-model", "Example")
+            state.policies["ws_first"].policy = {"video": {"enabled": False, "models": []}}
+            with pytest.raises(ToolFailed, match="video is disabled"):
+                await plugin.anycap_submit_video(context, "first", "Example")
+            assert calls == ["/v1/video/models"]
+
+    asyncio.run(verify())
+
+
+def test_full_operations_follow_workspace_policy_and_keep_video_handles_scoped(service_calls, monkeypatch) -> None:
+    factory, plugin, context, state = service_calls
+    context.deps.environment = object()
+    executor = AsyncMock(return_value={"data": {"task_id": TASK_ID, "status": "queued"}})
+    monkeypatch.setattr(tools, "execute", executor)
+
+    async def verify() -> None:
+        entries = await plugin.anycap_operations(context)
+        assert {
+            "audio_read",
+            "video_read",
+            "image_generate",
+            "music_generate",
+            "page_deploy",
+            "web_search",
+            "social_profile",
+            "drive_upload",
+            "snapshot_restore",
+            "draw_start",
+        } <= entries.keys()
+        assert entries["drive_delete"]["tool"] == "anycap_execute"
+        with pytest.raises(ToolFailed, match="Select an operation"):
+            await plugin.anycap_read(context, "drive_delete", {})
+        state.policies["ws_first"] = WorkspacePolicyRow(
+            workspace_id="ws_first",
+            policy={"audio_read": {"enabled": False}, "video_read": {"models": ["allowed"]}},
+        )
+        assert "audio_read" not in await plugin.anycap_operations(context)
+        with pytest.raises(ToolFailed, match="audio_read is disabled"):
+            await plugin.anycap_execute(context, "audio_read", {"url": "https://example.com/clip.wav"})
+        with pytest.raises(ToolFailed, match="valid AnyCap model ID"):
+            await plugin.anycap_execute(context, "video_read", {"url": "https://example.com/clip.mp4", "model": ""})
+        with pytest.raises(ToolFailed, match="issued for this workspace"):
+            await plugin.anycap_read(context, "video_task_get", {"task_id": TASK_ID})
+        executor.assert_not_awaited()
+        await plugin.anycap_execute(context, "video_read", {"url": "https://example.com/clip.mp4"})
+        assert executor.await_args.args[2] == {"url": "https://example.com/clip.mp4"}
+        submitted = await plugin.anycap_execute(context, "video_generate", {"model": "allowed", "prompt": "Test"})
+        assert submitted["task_handle"] == tools.make_task_handle(factory.keys["ws_first"], "ws_first", TASK_ID)
+        await plugin.anycap_read(context, "video_task_get", {"task_id": submitted["task_handle"]})
+        assert executor.await_args.args[2] == {"task_id": TASK_ID}
 
     asyncio.run(verify())
 

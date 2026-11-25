@@ -3,7 +3,9 @@
 import hashlib
 import hmac
 import json
-from typing import Annotated, Literal
+import re
+from dataclasses import asdict
+from typing import Annotated
 
 import httpx
 from a13n_harness import AbstractHarnessPlugin, AgentContext
@@ -14,17 +16,20 @@ from a13n_service.infra.errors import ServiceError
 from a13n_service.runs.attempts import AuthorityRevoked, authorize_execution
 from a13n_service.runs.runtime import Runtime
 from a13n_service.runs.tables import AttemptRow, RunRow
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field, JsonValue, SecretStr, TypeAdapter, ValidationError
 from pydantic_ai import RunContext, Tool
 from pydantic_ai.capabilities import Capability
 from pydantic_ai.exceptions import ToolFailed
 
 from a13n_anycap.client import API_ORIGIN, AnyCapClient, AnyCapError, MediaResult, TaskStatus, error_code, parse_result
 from a13n_anycap.credentials import APP_ID, get_workspace_key
+from a13n_anycap.executor import execute
+from a13n_anycap.operations import OPERATIONS, Feature
+from a13n_anycap.policy import Media, ModelId, WorkspacePolicy, get_workspace_policy
 
-type Media = Literal["video", "audio"]
-type ModelId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")]
 type TaskHandle = Annotated[str, Field(pattern=r"^ct_[A-Za-z0-9]{1,64}\.[0-9a-f]{32}$")]
+MODEL_ID = TypeAdapter(ModelId)
+VIDEO_TASK = re.compile(r"^ct_[A-Za-z0-9]{1,64}$")
 
 
 class Configuration(BaseModel, extra="forbid"):
@@ -79,13 +84,25 @@ class AnyCapTools(AbstractHarnessPlugin):
                     Tool(self.anycap_submit_video, requires_approval=self.config.require_generation_approval),
                     Tool(self.anycap_get_video_task),
                     Tool(self.anycap_generate_audio, requires_approval=self.config.require_generation_approval),
+                    Tool(self.anycap_operations),
+                    Tool(self.anycap_read),
+                    Tool(self.anycap_execute, requires_approval=self.config.require_generation_approval),
                 ],
             ),
         ]
 
-    async def _client(self, ctx: RunContext[AgentContext]) -> tuple[AnyCapClient, str]:
-        runtime, http = self.factory.runtime, self.factory.http
-        if runtime is None or http is None:
+    async def _client(self, ctx: RunContext[AgentContext], media: Media) -> tuple[AnyCapClient, str]:
+        workspace_id, settings, key = await self._workspace(ctx, credential=True)
+        self._check_policy(settings, media)
+        if self.factory.http is None or key is None:
+            raise ToolFailed("AnyCap credentials are not configured for this workspace.")
+        return AnyCapClient(self.factory.http, key), workspace_id
+
+    async def _workspace(
+        self, ctx: RunContext[AgentContext], *, credential: bool
+    ) -> tuple[str, WorkspacePolicy, SecretStr | None]:
+        runtime = self.factory.runtime
+        if runtime is None:
             raise ToolFailed("AnyCap is unavailable in this Service process.")
         instance = ctx.deps.instance
         run_id = instance.host_refs.get("run_id")
@@ -117,16 +134,89 @@ class AnyCapTools(AbstractHarnessPlugin):
                     raise ToolFailed("This Service run is no longer active.")
                 await authorize_execution(session, runtime.access, run)
                 workspace_id = run.workspace_id
-                key = await get_workspace_key(session, runtime.keys, run.organization_id, workspace_id)
+                settings = await get_workspace_policy(session, workspace_id)
+                key = (
+                    await get_workspace_key(session, runtime.keys, run.organization_id, workspace_id)
+                    if credential
+                    else None
+                )
         except AuthorityRevoked:
             raise ToolFailed("The Run is no longer authorized to use AnyCap.") from None
         except ServiceError:
             raise ToolFailed("Service could not verify the Run's authority.") from None
-        if key is None:
-            key = self.factory.keys.get(workspace_id)
-        if key is None:
-            raise ToolFailed("AnyCap credentials are not configured for this workspace.")
-        return AnyCapClient(http, key), workspace_id
+        return workspace_id, settings, (key or self.factory.keys.get(workspace_id)) if credential else None
+
+    @staticmethod
+    def _check_policy(policy: WorkspacePolicy, feature: Feature) -> None:
+        if not policy.is_enabled(feature):
+            raise ToolFailed(f"AnyCap {feature} is disabled for this workspace.")
+
+    async def anycap_operations(self, ctx: RunContext[AgentContext], feature: Feature | None = None) -> dict:
+        """Discover enabled AnyCap operations and their required or optional parameters."""
+        _, settings, _ = await self._workspace(ctx, credential=False)
+        return {
+            name: {
+                "feature": operation.feature,
+                "description": operation.description,
+                "tool": "anycap_read" if operation.effect == "read" else "anycap_execute",
+                "parameters": [asdict(field) for field in operation.inputs],
+            }
+            for name, operation in OPERATIONS.items()
+            if (feature is None or operation.feature == feature) and settings.is_enabled(operation.feature)
+        }
+
+    async def anycap_read(
+        self, ctx: RunContext[AgentContext], operation: str, arguments: dict[str, JsonValue]
+    ) -> JsonValue:
+        """Call a read-only AnyCap operation listed by anycap_operations."""
+        return await self._operation(ctx, operation, arguments, "read")
+
+    async def anycap_execute(
+        self, ctx: RunContext[AgentContext], operation: str, arguments: dict[str, JsonValue]
+    ) -> JsonValue:
+        """Call an AnyCap operation with possible charges or changes. Discover its inputs with anycap_operations."""
+        return await self._operation(ctx, operation, arguments, "write")
+
+    async def _operation(
+        self, ctx: RunContext[AgentContext], name: str, arguments: dict[str, JsonValue], effect: str
+    ) -> JsonValue:
+        operation = OPERATIONS.get(name)
+        if operation is None or operation.effect != effect:
+            raise ToolFailed("Select an operation listed for this AnyCap tool.")
+        workspace_id, settings, key = await self._workspace(ctx, credential=operation.transport != "environment")
+        self._check_policy(settings, operation.feature)
+        if operation.model and "model" in arguments:
+            try:
+                MODEL_ID.validate_python(arguments["model"])
+            except ValidationError:
+                raise ToolFailed("Select a valid AnyCap model ID.") from None
+        if name in {"video_task_get", "video_task_wait"}:
+            if key is None:
+                raise ToolFailed("AnyCap credentials are not configured for this workspace.")
+            handle = arguments.get("task_id")
+            task_id = handle.split(".", 1)[0] if isinstance(handle, str) else ""
+            if not VIDEO_TASK.fullmatch(task_id) or not hmac.compare_digest(
+                handle, make_task_handle(key, workspace_id, task_id)
+            ):
+                raise ToolFailed("Use an AnyCap task handle issued for this workspace and credential.")
+            arguments = {**arguments, "task_id": task_id}
+        try:
+            result = await execute(
+                ctx.deps.environment, operation, arguments, workspace_id, key, ctx.deps.configuration.authorize_url
+            )
+        except HostNotAllowedError:
+            raise ToolFailed("The Run's host policy disallows this AnyCap input URL.") from None
+        if name == "video_generate" and key is not None and isinstance(result, dict):
+            data = result.get("result", result)
+            if isinstance(data, dict):
+                data = data.get("data", data)
+            if (
+                isinstance(data, dict)
+                and isinstance(task_id := data.get("task_id"), str)
+                and VIDEO_TASK.fullmatch(task_id)
+            ):
+                result["task_handle"] = make_task_handle(key, workspace_id, task_id)
+        return result
 
     def _trace_id(self, client: AnyCapClient, ctx: RunContext[AgentContext], tool: str) -> str:
         if not ctx.tool_call_id:
@@ -135,20 +225,27 @@ class AnyCapTools(AbstractHarnessPlugin):
         return f"trc_{digest}"
 
     async def anycap_list_models(self, ctx: RunContext[AgentContext], media: Media) -> dict:
-        """List current AnyCap models for video or audio generation."""
-        client, _ = await self._client(ctx)
+        """List available AnyCap models for image, video, music or audio."""
+        client, _ = await self._client(ctx, media)
         try:
-            return await client.read(f"/v1/{media}/models")
+            return await client.catalog(client.http, media)
         except AnyCapError as error:
             raise ToolFailed(str(error)) from None
 
-    async def anycap_model_schema(self, ctx: RunContext[AgentContext], media: Media, model: ModelId) -> dict:
-        """Get the generation schema for an AnyCap model before choosing parameters."""
-        client, _ = await self._client(ctx)
+    async def anycap_model_schema(
+        self,
+        ctx: RunContext[AgentContext],
+        media: Media,
+        model: ModelId,
+        operation: Annotated[str, Field(pattern=r"^[a-z][a-z-]{0,40}$")] = "generate",
+        mode: Annotated[str | None, Field(pattern=r"^[a-z][a-z0-9-]{0,64}$")] = None,
+    ) -> dict:
+        """Get the exact schema for an AnyCap model, operation and mode."""
+        client, _ = await self._client(ctx, media)
         try:
             return await client.read(
                 f"/v1/{media}/models/{model}/schema",
-                params={"operation": "generate", "mode": f"text-to-{media}"},
+                params={"operation": operation, **({"mode": mode} if mode else {})},
             )
         except AnyCapError as error:
             raise ToolFailed(str(error)) from None
@@ -164,7 +261,7 @@ class AnyCapTools(AbstractHarnessPlugin):
         generate_audio: bool | None = None,
     ) -> dict:
         """Submit a paid text-to-video job. Save its handle to check status in a later Run."""
-        client, workspace_id = await self._client(ctx)
+        client, workspace_id = await self._client(ctx, "video")
         trace_id = self._trace_id(client, ctx, "submit-video")
         body = {
             "model": model,
@@ -186,7 +283,7 @@ class AnyCapTools(AbstractHarnessPlugin):
 
     async def anycap_get_video_task(self, ctx: RunContext[AgentContext], task_handle: TaskHandle) -> dict:
         """Get a video's status and available download links using the workspace task handle."""
-        client, workspace_id = await self._client(ctx)
+        client, workspace_id = await self._client(ctx, "video")
         task_id = task_handle.split(".", 1)[0]
         if not hmac.compare_digest(task_handle, make_task_handle(client.key, workspace_id, task_id)):
             raise ToolFailed("Use an AnyCap task handle issued for this workspace and credential.")
@@ -217,7 +314,7 @@ class AnyCapTools(AbstractHarnessPlugin):
         speaker_id: Annotated[str | None, Field(max_length=128)] = None,
     ) -> dict:
         """Synthesize a short paid speech clip and return download links."""
-        client, _ = await self._client(ctx)
+        client, _ = await self._client(ctx, "audio")
         trace_id = self._trace_id(client, ctx, "generate-audio")
         body = {"model": model, "prompt": prompt, "mode": "text-to-audio"}
         if speaker_id:

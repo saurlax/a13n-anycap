@@ -8,6 +8,8 @@ from typing import Literal
 import httpx
 from pydantic import BaseModel, Field, HttpUrl, SecretStr, ValidationError
 
+from a13n_anycap.policy import Media, ModelId
+
 API_ORIGIN = "https://api.anycap.ai"
 MAX_RESPONSE_BYTES = 1 << 20
 
@@ -36,6 +38,25 @@ class TaskStatus(BaseModel):
     error: dict[str, object] | None = None
 
 
+class GenerationMode(BaseModel):
+    mode: str
+
+
+class CatalogOperation(BaseModel):
+    operation: str
+    modes: list[GenerationMode] = Field(default_factory=list)
+
+
+class CatalogModel(BaseModel):
+    model: ModelId
+    display_name: str
+    status: str
+    operations: list[CatalogOperation]
+
+    def available(self) -> bool:
+        return self.status == "active" and bool(self.operations)
+
+
 def error_code(value: object) -> str | None:
     if isinstance(value, dict):
         code = value.get("code")
@@ -50,27 +71,46 @@ class AnyCapClient:
         self.key = key
 
     async def read(self, path: str, *, params: dict[str, str] | None = None) -> dict:
-        return await self._request("GET", path, params=params)
+        return await self._request(self.http, "GET", path, key=self.key, params=params)
 
     async def generate(self, path: str, body: dict, *, trace_id: str) -> dict:
-        return await self._request("POST", path, body=body, trace_id=trace_id)
+        return await self._request(self.http, "POST", path, key=self.key, body=body, trace_id=trace_id)
 
+    @classmethod
+    async def catalog(cls, http: httpx.AsyncClient, media: Media) -> dict:
+        payload = await cls._request(http, "GET", f"/v1/{media}/models")
+        if not isinstance(entries := payload.get("models"), list):
+            raise cls._response_error(None)
+        models = []
+        for entry in entries:
+            try:
+                model = CatalogModel.model_validate(entry)
+            except ValidationError:
+                continue
+            if model.available():
+                models.append(entry)
+        return {**payload, "models": models}
+
+    @staticmethod
     async def _request(
-        self,
+        http: httpx.AsyncClient,
         method: Literal["GET", "POST"],
         path: str,
         *,
+        key: SecretStr | None = None,
         params: dict[str, str] | None = None,
         body: dict | None = None,
         trace_id: str | None = None,
     ) -> dict:
-        headers = {"Authorization": f"Bearer {self.key.get_secret_value()}", "Accept-Encoding": "identity"}
+        headers = {"Accept-Encoding": "identity"}
+        if key is not None:
+            headers["Authorization"] = f"Bearer {key.get_secret_value()}"
         if trace_id is not None:
             headers["X-Trace-ID"] = trace_id
         try:
             async with (
                 asyncio.timeout(55),
-                self.http.stream(method, API_ORIGIN + path, headers=headers, params=params, json=body) as response,
+                http.stream(method, API_ORIGIN + path, headers=headers, params=params, json=body) as response,
             ):
                 if response.headers.get("Content-Encoding", "identity").lower() != "identity":
                     raise ValueError("Unexpected content encoding")
@@ -84,10 +124,10 @@ class AnyCapClient:
             if not isinstance(payload, dict):
                 raise ValueError("Unexpected response type")
         except (httpx.HTTPError, TimeoutError, ValueError, RecursionError):
-            raise self._response_error(trace_id) from None
+            raise AnyCapClient._response_error(trace_id) from None
 
         if status >= 500 and trace_id is not None:
-            raise self._response_error(trace_id)
+            raise AnyCapClient._response_error(trace_id)
         if status >= 400:
             code = error_code(payload.get("error"))
             detail = f", {code}" if code else ""
@@ -95,7 +135,7 @@ class AnyCapClient:
                 raise AnyCapError(f"AnyCap rejected the workspace credential or capability (HTTP {status}{detail}).")
             raise AnyCapError(f"AnyCap rejected the request (HTTP {status}{detail}).")
         if not 200 <= status < 300 or payload.get("status") != "success":
-            raise self._response_error(trace_id)
+            raise AnyCapClient._response_error(trace_id)
         return payload
 
     @staticmethod
