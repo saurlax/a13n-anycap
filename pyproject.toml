@@ -1,6 +1,6 @@
 [project]
 name = "a13n-anycap"
-version = "0.1.0"
+version = "0.1.1"
 description = "AnyCap media generation tools for a13n Service"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -15,10 +15,10 @@ dependencies = [
 ]
 
 [project.entry-points."a13n_service.app_plugins"]
-"a13n-anycap" = "a13n_anycap.app:definition"
+"saurlax.anycap" = "a13n_anycap.app:definition"
 
 [project.entry-points."a13n_harness.plugins"]
-"a13n-anycap" = "a13n_anycap.tools:AnyCapFactory"
+"saurlax.anycap" = "a13n_anycap.tools:AnyCapFactory"
 
 [build-system]
 requires = ["hatchling>=1.27,<2"]

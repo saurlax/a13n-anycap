@@ -23,7 +23,7 @@ Use Python 3.13 and a13n Service 0.3.2, the versions tested by this repository. 
   "plugins": [
     {
       "instance_name": "anycap",
-      "plugin_key": "a13n-anycap",
+      "plugin_key": "saurlax.anycap",
       "config": {}
     }
   ]

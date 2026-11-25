@@ -9,7 +9,7 @@ resolution-markers = [
 
 [[package]]
 name = "a13n-anycap"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "a13n-harness" },

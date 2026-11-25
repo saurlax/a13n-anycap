@@ -21,7 +21,7 @@ from pydantic_ai.exceptions import ToolFailed
 
 from a13n_anycap.client import API_ORIGIN, AnyCapClient, AnyCapError, MediaResult, TaskStatus, error_code, parse_result
 
-APP_ID = "a13n-anycap"
+APP_ID = "saurlax.anycap"
 type Media = Literal["video", "audio"]
 type ModelId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")]
 type TaskHandle = Annotated[str, Field(pattern=r"^ct_[A-Za-z0-9]{1,64}\.[0-9a-f]{32}$")]

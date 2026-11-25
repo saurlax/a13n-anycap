@@ -24,7 +24,7 @@ TASK_ID = "ct_0123456789abcdef"
 
 
 def test_service_discovers_app_and_paid_tool_requests_approval() -> None:
-    app = next(item for item in discover_apps() if item.app_id == APP_ID)
+    app = next(item for item in discover_apps() if item.app_id == "saurlax.anycap")
     assert app.distribution == "a13n-anycap"
     assert app.definition.factory_keys == {APP_ID}
     assert build_app(role="worker").state is not None
