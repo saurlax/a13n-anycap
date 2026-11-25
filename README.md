@@ -26,7 +26,7 @@ An a13n Service App plugin for AnyCap media, web, social, delivery, and collabor
 
 Use Python 3.13 and a13n Service 0.3.2, the versions tested by this repository. Build the wheel with `uv build --wheel` and install the same wheel into every Service control and worker Python environment. See the [Service App plugin installation guide](https://github.com/converge-ai-labs/agent-foundation/blob/main/docs/a13n-service/app-plugins.md#deploy-app-plugins) for local and container deployment.
 
-Install the native [AnyCap CLI 0.6.6](https://docs.anycap.ai/getting-started/install/) on every Service worker. Set `A13N_ANYCAP_CLI_PATH` to its absolute path when it is outside `PATH`. Install the CLI in the Agent Environment as well for downloads, annotation, and whiteboards. Open collaboration URLs in a browser that can reach that Environment's loopback address.
+Install the native [AnyCap CLI 0.6.6](https://docs.anycap.ai/getting-started/install/) on every Service worker. Set `ANYCAP_CLI_PATH` to its absolute path when it is outside `PATH`. Install the CLI in the Agent Environment as well for downloads, annotation, and whiteboards. Open collaboration URLs in a browser that can reach that Environment's loopback address.
 
 1. In Console, open **Settings → Organization → App plugins** and enable **AnyCap**.
 2. Open **AnyCap** in the target workspace and save an API key as a workspace administrator. Service encrypts the key using its configured encryption key ring. Saving, replacing, or removing a workspace key takes effect without a Service restart.
@@ -48,7 +48,7 @@ Runs with an outbound host allowlist must include `api.anycap.ai` and any input 
 
 On the **AnyCap** workspace page, administrators can enable or disable each feature. Features default to enabled. Disabling video also turns off video task lookups. Agents can still discover available models and schemas for enabled generation features.
 
-For headless configuration, set `A13N_ANYCAP_WORKSPACE_KEYS` in each Service process to a JSON mapping such as `{"ws_example":"<AnyCap API key>"}` and restart Service. A saved workspace key takes precedence over the environment mapping. Removing a saved workspace key restores its environment binding when one exists.
+For headless configuration, set `ANYCAP_WORKSPACE_KEYS` in each Service process to a JSON mapping such as `{"ws_example":"<AnyCap API key>"}` and restart Service. A saved workspace key takes precedence over the environment mapping. Removing a saved workspace key restores its environment binding when one exists.
 
 ## Generate and retrieve a video
 

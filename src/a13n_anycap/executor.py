@@ -238,11 +238,11 @@ async def stage_value(field: Input, value: JsonValue, staging: WorkspaceFiles) -
 
 
 def cli_binary() -> str:
-    candidate = os.getenv("A13N_ANYCAP_CLI_PATH") or shutil.which("anycap")
+    candidate = os.getenv("ANYCAP_CLI_PATH") or shutil.which("anycap")
     if not candidate or not Path(candidate).is_file():
         raise ToolFailed("Install the AnyCap 0.6.6 native executable on the Service workers.")
     if os.name == "nt" and Path(candidate).suffix.lower() != ".exe":
-        raise ToolFailed("Set A13N_ANYCAP_CLI_PATH to the native AnyCap executable.")
+        raise ToolFailed("Set ANYCAP_CLI_PATH to the native AnyCap executable.")
     return str(Path(candidate).resolve())
 
 

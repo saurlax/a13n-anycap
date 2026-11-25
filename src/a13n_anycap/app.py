@@ -30,7 +30,7 @@ from a13n_anycap.tools import AnyCapFactory
 
 type WorkspaceKeyId = Annotated[str, StringConstraints(pattern=r"^ws_[a-zA-Z0-9]+$")]
 WORKSPACE_KEYS = TypeAdapter(dict[WorkspaceKeyId, ApiKey])
-KEYS_VARIABLE = "A13N_ANYCAP_WORKSPACE_KEYS"
+KEYS_VARIABLE = "ANYCAP_WORKSPACE_KEYS"
 router = app_router(APP_ID)
 
 
