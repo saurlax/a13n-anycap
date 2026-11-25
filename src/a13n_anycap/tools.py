@@ -20,8 +20,8 @@ from pydantic_ai.capabilities import Capability
 from pydantic_ai.exceptions import ToolFailed
 
 from a13n_anycap.client import API_ORIGIN, AnyCapClient, AnyCapError, MediaResult, TaskStatus, error_code, parse_result
+from a13n_anycap.credentials import APP_ID, get_workspace_key
 
-APP_ID = "saurlax.anycap"
 type Media = Literal["video", "audio"]
 type ModelId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")]
 type TaskHandle = Annotated[str, Field(pattern=r"^ct_[A-Za-z0-9]{1,64}\.[0-9a-f]{32}$")]
@@ -117,11 +117,13 @@ class AnyCapTools(AbstractHarnessPlugin):
                     raise ToolFailed("This Service run is no longer active.")
                 await authorize_execution(session, runtime.access, run)
                 workspace_id = run.workspace_id
+                key = await get_workspace_key(session, runtime.keys, run.organization_id, workspace_id)
         except AuthorityRevoked:
             raise ToolFailed("The Run is no longer authorized to use AnyCap.") from None
         except ServiceError:
             raise ToolFailed("Service could not verify the Run's authority.") from None
-        key = self.factory.keys.get(workspace_id)
+        if key is None:
+            key = self.factory.keys.get(workspace_id)
         if key is None:
             raise ToolFailed("AnyCap credentials are not configured for this workspace.")
         return AnyCapClient(http, key), workspace_id

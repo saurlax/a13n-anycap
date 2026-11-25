@@ -1,0 +1,15 @@
+.anycap-settings {
+  max-width: 34rem;
+}
+
+.anycap-settings form {
+  display: grid;
+  gap: 0.75rem;
+  margin-block: 1rem;
+}
+
+.anycap-settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}

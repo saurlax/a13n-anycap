@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -11,13 +12,17 @@ from a13n_harness.configuration import RunConfiguration
 from a13n_harness.plugin_factories import HarnessPluginFactoryContext
 from a13n_service.app import build_app
 from a13n_service.app_definitions import discover_apps
+from a13n_service.infra.crypto import KeyRing
+from a13n_service.infra.errors import ServiceError
 from a13n_service.runs.tables import AttemptRow, RunRow
+from pydantic import SecretStr
 from pydantic_ai import Agent, DeferredToolRequests
 from pydantic_ai.exceptions import ToolFailed
 from pydantic_ai.models.test import TestModel
 
 from a13n_anycap import tools
 from a13n_anycap.app import KEYS_VARIABLE, load_workspace_keys
+from a13n_anycap.credentials import WorkspaceCredential, credential_location, get_workspace_key
 from a13n_anycap.tools import APP_ID, AnyCapFactory, AnyCapTools
 
 TASK_ID = "ct_0123456789abcdef"
@@ -27,6 +32,8 @@ def test_service_discovers_app_and_paid_tool_requests_approval() -> None:
     app = next(item for item in discover_apps() if item.app_id == "saurlax.anycap")
     assert app.distribution == "a13n-anycap"
     assert app.definition.factory_keys == {APP_ID}
+    assert app.definition.frontend is not None
+    assert app.definition.database is not None
     assert build_app(role="worker").state is not None
     plugin = AnyCapFactory().create_plugin(HarnessPluginFactoryContext(APP_ID, "anycap", {}, {}))
     agent = Agent(
@@ -50,10 +57,21 @@ def service_calls(monkeypatch):
         cancel_requested_at=None,
         principal_id="usr_test",
         workspace_id="ws_first",
+        organization_id="org_test",
     )
     attempt = SimpleNamespace(run_id="run_a", status="running", lease_expires_at=current + timedelta(seconds=60))
-    session = SimpleNamespace(get=AsyncMock(side_effect=lambda table, _: {RunRow: run, AttemptRow: attempt}[table]))
-    state = SimpleNamespace(in_session=False, run=run, attempt=attempt)
+    credentials = {}
+    session = SimpleNamespace(
+        get=AsyncMock(
+            side_effect=lambda table, row_id: (
+                credentials.get(row_id) if table is WorkspaceCredential else {RunRow: run, AttemptRow: attempt}[table]
+            )
+        )
+    )
+    keys = KeyRing(active_key_id="test", keys={"test": SecretStr(base64.b64encode(bytes(32)).decode())})
+    state = SimpleNamespace(
+        in_session=False, run=run, attempt=attempt, credentials=credentials, session=session, keys=keys
+    )
 
     @asynccontextmanager
     async def short_session(_):
@@ -68,7 +86,7 @@ def service_calls(monkeypatch):
     monkeypatch.setattr(tools, "authorize_execution", AsyncMock())
     monkeypatch.setenv(KEYS_VARIABLE, '{"ws_first":"test-key","ws_second":"test-key"}')
     factory = AnyCapFactory()
-    factory.runtime = SimpleNamespace(storage=object(), access=object())
+    factory.runtime = SimpleNamespace(storage=object(), access=object(), keys=keys)
     factory.keys = load_workspace_keys()
     plugin = factory.create_plugin(HarnessPluginFactoryContext(APP_ID, "anycap", {}, {}))
     assert isinstance(plugin, AnyCapTools)
@@ -84,6 +102,30 @@ def service_calls(monkeypatch):
         tool_call_id="call_a",
     )
     return factory, plugin, context, state
+
+
+def test_workspace_key_overrides_environment_and_is_bound_to_its_workspace(service_calls) -> None:
+    factory, plugin, context, state = service_calls
+
+    async def verify() -> None:
+        async with httpx.AsyncClient() as http:
+            factory.http = http
+            encrypted = state.keys.protect(
+                b"workspace-key", credential_location("org_test", "ws_first")
+            ).model_dump_json()
+            state.credentials["ws_first"] = WorkspaceCredential(workspace_id="ws_first", encrypted_key=encrypted)
+            client, _ = await plugin._client(context)
+            assert client.key.get_secret_value() == "workspace-key"
+
+            state.credentials["ws_second"] = WorkspaceCredential(workspace_id="ws_second", encrypted_key=encrypted)
+            with pytest.raises(ServiceError):
+                await get_workspace_key(state.session, state.keys, "org_test", "ws_second")
+
+            del state.credentials["ws_first"]
+            client, _ = await plugin._client(context)
+            assert client.key == factory.keys["ws_first"]
+
+    asyncio.run(verify())
 
 
 def test_video_submit_and_cross_run_read_without_cross_workspace_access(service_calls) -> None:

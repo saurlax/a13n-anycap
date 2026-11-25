@@ -14,8 +14,8 @@ An App plugin that gives a13n Service agents direct access to AnyCap's HTTPS API
 
 Use Python 3.13 and a13n Service 0.3.2, the versions tested by this repository. Build the wheel with `uv build --wheel` and install the same wheel into every Service control and worker Python environment. See the [Service App plugin installation guide](https://github.com/converge-ai-labs/agent-foundation/blob/main/docs/a13n-service/app-plugins.md#deploy-app-plugins) for local and container deployment.
 
-1. Provide `A13N_ANYCAP_WORKSPACE_KEYS` to each Service process through the deployment's secret configuration. Its value is a JSON object mapping a workspace ID to an AnyCap API key, for example `{"ws_example":"<AnyCap API key>"}`. Each binding uses that key's AnyCap account and credits. Restart Service after updating the bindings.
-2. In Console, open **Settings → Organization → App plugins** and enable **AnyCap**.
+1. In Console, open **Settings → Organization → App plugins** and enable **AnyCap**.
+2. Open **AnyCap** in the target workspace and save an API key as a workspace administrator. Service encrypts the key using its configured encryption key ring. Saving, replacing, or removing a workspace key takes effect without a Service restart.
 3. Add the AnyCap plugin to the Agent's configuration. The equivalent Agent config fragment is below.
 
 ```json
@@ -32,6 +32,8 @@ Use Python 3.13 and a13n Service 0.3.2, the versions tested by this repository. 
 
 Runs with an outbound host allowlist must include `api.anycap.ai`. Generation requires approval by default because it spends AnyCap credits. Set `require_generation_approval` to `false` in the plugin instance's config for unattended generation.
 
+For headless configuration, set `A13N_ANYCAP_WORKSPACE_KEYS` in each Service process to a JSON mapping such as `{"ws_example":"<AnyCap API key>"}` and restart Service. A saved workspace key takes precedence over the environment mapping. Removing a saved workspace key restores its environment binding when one exists.
+
 ## Generate and retrieve a video
 
 Ask an Agent with AnyCap enabled to look up a text-to-video model and submit a short clip using that model's supported duration and aspect ratio. Approve the tool call if prompted. Save the returned `task_handle`, then ask the Agent to check that handle in a later Run. If the video is still processing, the tool reports its status and AnyCap's suggested polling interval. A successful lookup returns current download links. For speech, ask the Agent to inspect a text-to-audio model and synthesize a short line.
@@ -40,7 +42,7 @@ Task handles are scoped to the workspace and its configured API key. Rotate the 
 
 A generation request can reach AnyCap even if the response is lost. The tool reports the trace ID when the outcome is unknown. Check that request in AnyCap before starting another generation. Only video has a separate task API. Audio waits for an HTTP response for up to 55 seconds and is intended for short clips.
 
-This release covers text inputs and links. Reference uploads, video editing, music generation, and a Console account management page are outside its scope.
+This release covers text inputs and links. Reference uploads, video editing, and music generation are outside its scope.
 
 ## Develop
 
